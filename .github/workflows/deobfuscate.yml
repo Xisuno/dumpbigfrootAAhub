@@ -1,0 +1,92 @@
+
+name: Analyze WEAREDEVS Lua
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Find Lua file
+        id: source
+        run: |
+          FILE=$(find . -type f -name "*.lua" | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "No Lua file found"
+            exit 1
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Analyze obfuscation
+        run: |
+          mkdir -p output
+
+          python - "${{ steps.source.outputs.file }}" <<'PY'
+          import sys
+          import re
+          import hashlib
+          from pathlib import Path
+
+          source = Path(sys.argv[1]).read_text(
+              encoding="utf-8", errors="replace"
+          )
+
+          report = [
+              "WEAREDEVS Lua Analysis",
+              "=====================",
+              f"File size: {len(source)} characters",
+              f"SHA256: {hashlib.sha256(source.encode()).hexdigest()}",
+              "",
+              "Obfuscation indicators:"
+          ]
+
+          patterns = {
+              "String table": r'local\s+\w+\s*=\s*\{',
+              "Custom decoder": r'string\.char',
+              "String extraction": r'string\.sub',
+              "Length operations": r'string\.len',
+              "Virtualized execution": r'while\s+\w+\s+do',
+              "Dynamic calls": r'loadstring',
+              "Environment access": r'getfenv|_ENV',
+              "Metatables": r'setmetatable|getmetatable',
+          }
+
+          for name, pattern in patterns.items():
+              count = len(re.findall(pattern, source))
+              report.append(f"{name}: {count} occurrence(s)")
+
+          report.extend([
+              "",
+              "Note: Static analysis only.",
+              "No code was executed.",
+              "Virtualized source reconstruction requires",
+              "additional analysis of the interpreter."
+          ])
+
+          Path("output/report.txt").write_text(
+              "\n".join(report)
+          )
+
+          Path("output/source.lua").write_text(source)
+
+          print("\n".join(report))
+          PY
+
+      - name: Upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: wearedevs-analysis
+          path: output/

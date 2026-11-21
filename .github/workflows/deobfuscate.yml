@@ -1,92 +1,401 @@
+WEAREDEVS STATIC WORKFLOW - TEXT EDITION
+========================================
 
-name: Analyze WEAREDEVS Lua
+
+
+===== FILE: .github/workflows/deobfuscate.yml =====
+
+name: WEAREDEVS Static Deobfuscation
 
 on:
   workflow_dispatch:
+    inputs:
+      lua_file:
+        description: 'Path to the Lua file in the repository'
+        required: true
+        default: 'script.lua'
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  analyze:
+  deobfuscate:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
-      - name: Find Lua file
-        id: source
+      - name: Validate input
+        shell: bash
+        env:
+          LUA_FILE: ${{ inputs.lua_file }}
         run: |
-          FILE=$(find . -type f -name "*.lua" | head -n 1)
-          if [ -z "$FILE" ]; then
-            echo "No Lua file found"
+          if [ ! -f "$LUA_FILE" ]; then
+            echo "Lua file not found: $LUA_FILE"
             exit 1
           fi
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Analyze obfuscation
+      - name: Recover WEAREDEVS string table
+        env:
+          LUA_FILE: ${{ inputs.lua_file }}
         run: |
-          mkdir -p output
+          python tools/wearedevs_static.py "$LUA_FILE" output
 
-          python - "${{ steps.source.outputs.file }}" <<'PY'
-          import sys
-          import re
-          import hashlib
-          from pathlib import Path
-
-          source = Path(sys.argv[1]).read_text(
-              encoding="utf-8", errors="replace"
-          )
-
-          report = [
-              "WEAREDEVS Lua Analysis",
-              "=====================",
-              f"File size: {len(source)} characters",
-              f"SHA256: {hashlib.sha256(source.encode()).hexdigest()}",
-              "",
-              "Obfuscation indicators:"
-          ]
-
-          patterns = {
-              "String table": r'local\s+\w+\s*=\s*\{',
-              "Custom decoder": r'string\.char',
-              "String extraction": r'string\.sub',
-              "Length operations": r'string\.len',
-              "Virtualized execution": r'while\s+\w+\s+do',
-              "Dynamic calls": r'loadstring',
-              "Environment access": r'getfenv|_ENV',
-              "Metatables": r'setmetatable|getmetatable',
-          }
-
-          for name, pattern in patterns.items():
-              count = len(re.findall(pattern, source))
-              report.append(f"{name}: {count} occurrence(s)")
-
-          report.extend([
-              "",
-              "Note: Static analysis only.",
-              "No code was executed.",
-              "Virtualized source reconstruction requires",
-              "additional analysis of the interpreter."
-          ])
-
-          Path("output/report.txt").write_text(
-              "\n".join(report)
-          )
-
-          Path("output/source.lua").write_text(source)
-
-          print("\n".join(report))
-          PY
-
-      - name: Upload analysis
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: wearedevs-analysis
+          name: wearedevs-static-deobfuscation
           path: output/
+          if-no-files-found: error
+
+
+===== FILE: tools/wearedevs_static.py =====
+
+#!/usr/bin/env python3
+"""Static decoder for the WEAREDEVS v1.0.0 string-table format.
+
+This tool parses only the obfuscator's literal tables and arithmetic constants.
+It never imports, evaluates, or executes the target Lua program.
+It recovers the shuffled string table, including strings encoded with the
+custom 85-character alphabet. It does not reconstruct the virtualized program.
+"""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+
+def extract_braced(source: str, pattern: str) -> str:
+    match = re.search(pattern, source)
+    if not match:
+        raise ValueError(f"Could not find table matching: {pattern}")
+    start = match.end() - 1
+    depth = 0
+    quote = None
+    escaped = False
+    for pos in range(start, len(source)):
+        char = source[pos]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "\\\"'":
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : pos + 1]
+    raise ValueError("Unterminated Lua table")
+
+
+def split_top_level(text: str, separators: str = ",;") -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quote = None
+    escaped = False
+    for pos, char in enumerate(text):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "\\\"'":
+            quote = char
+        elif char in "{[ (".replace(" ", ""):
+            depth += 1
+        elif char in "}])":
+            depth -= 1
+        elif char in separators and depth == 0:
+            item = text[start:pos].strip()
+            if item:
+                parts.append(item)
+            start = pos + 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def lua_unescape(raw: str) -> str:
+    # The obfuscator's literal tables use ordinary Lua quote/backslash escapes.
+    # unicode_escape also handles the escaped quotes present in this format.
+    return bytes(raw, "utf-8").decode("unicode_escape")
+
+
+def parse_string_table(table: str) -> list[str]:
+    values: list[str] = []
+    pos = 1
+    end = len(table) - 1
+    while pos < end:
+        char = table[pos]
+        if char.isspace() or char in ",;":
+            pos += 1
+            continue
+        if char not in "\\\"'":
+            raise ValueError(f"Unexpected token in string table near: {table[pos:pos+30]!r}")
+        quote = char
+        pos += 1
+        start = pos
+        escaped = False
+        while pos < end:
+            current = table[pos]
+            if escaped:
+                escaped = False
+            elif current == "\\":
+                escaped = True
+            elif current == quote:
+                break
+            pos += 1
+        if pos >= end:
+            raise ValueError("Unterminated string in E table")
+        values.append(lua_unescape(table[start:pos]))
+        pos += 1
+    return values
+
+
+def eval_integer_expression(expression: str) -> int:
+    """Evaluate a restricted integer arithmetic expression; no calls/names."""
+    tree = ast.parse(expression.strip(), mode="eval").body
+
+    def visit(node: ast.AST) -> int:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = visit(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Mod, ast.FloorDiv, ast.Pow)
+        ):
+            left, right = visit(node.left), visit(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            if isinstance(node.op, ast.FloorDiv):
+                return left // right
+            return left**right
+        raise ValueError(f"Unsupported arithmetic expression: {expression!r}")
+
+    return visit(tree)
+
+
+def parse_alphabet(table: str) -> dict[str, int]:
+    alphabet: dict[str, int] = {}
+    for entry in split_top_level(table[1:-1]):
+        pieces = split_top_level(entry, "=")
+        if len(pieces) != 2:
+            raise ValueError(f"Malformed alphabet entry: {entry!r}")
+        key_expr, value_expr = pieces
+        if key_expr.startswith("["):
+            key_match = re.fullmatch(r"\[\s*([\"'])(.*)\1\s*\]", key_expr, re.S)
+            if not key_match:
+                raise ValueError(f"Unsupported alphabet key: {key_expr!r}")
+            key = lua_unescape(key_match.group(2))
+        else:
+            key = key_expr.strip()
+        alphabet[key] = eval_integer_expression(value_expr)
+    if len(alphabet) != 85 or set(alphabet.values()) != set(range(85)):
+        raise ValueError("The extracted alphabet is not a complete 0..84 mapping")
+    return alphabet
+
+
+def parse_shuffle_pairs(source: str) -> list[tuple[int, int]]:
+    table = extract_braced(source, r"ipairs\s*\(\s*\{")
+    pairs: list[tuple[int, int]] = []
+    for item in split_top_level(table[1:-1]):
+        if not (item.startswith("{") and item.endswith("}")):
+            continue
+        values = split_top_level(item[1:-1])
+        if len(values) != 2:
+            raise ValueError(f"Unexpected shuffle pair: {item!r}")
+        pairs.append((eval_integer_expression(values[0]), eval_integer_expression(values[1])))
+    if not pairs:
+        raise ValueError("No initial E-table shuffle pairs were found")
+    return pairs
+
+
+def decode_custom85(value: str, alphabet: dict[str, int]) -> bytes:
+    if not value.startswith("4"):
+        raise ValueError("Expected custom-85 marker '4'")
+    encoded = value[1:]
+    output = bytearray()
+    for offset in range(0, len(encoded), 5):
+        chunk = encoded[offset : offset + 5]
+        count = len(chunk)
+        if count == 1:
+            # The target decoder emits no byte for a one-character tail.
+            continue
+        number = 0
+        for char in chunk:
+            if char not in alphabet:
+                raise ValueError(f"Character {char!r} is absent from the extracted alphabet")
+            number = number * 85 + alphabet[char]
+        for _ in range(5 - count):
+            number = number * 85 + 84
+        number &= 0xFFFFFFFF
+        output.extend(number.to_bytes(4, "big")[: count - 1])
+    return bytes(output)
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("Usage: wearedevs_static.py input.lua output_dir", file=sys.stderr)
+        return 2
+
+    input_path = Path(sys.argv[1])
+    output_dir = Path(sys.argv[2])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_bytes = input_path.read_bytes()
+    source = source_bytes.decode("utf-8", errors="replace")
+
+    e_table = extract_braced(source, r"\blocal\s+E\s*=\s*\{")
+    entries = parse_string_table(e_table)
+    alphabet_table = extract_braced(source, r"\blocal\s+s\s*=\s*\{")
+    alphabet = parse_alphabet(alphabet_table)
+    shuffle_pairs = parse_shuffle_pairs(source)
+
+    for left, right in shuffle_pairs:
+        while left < right:
+            if not (1 <= left <= len(entries) and 1 <= right <= len(entries)):
+                raise ValueError("Shuffle index is outside the E table")
+            entries[left - 1], entries[right - 1] = entries[right - 1], entries[left - 1]
+            left += 1
+            right -= 1
+
+    recovered = []
+    for index, encoded in enumerate(entries, start=1):
+        if encoded.startswith("4"):
+            raw = decode_custom85(encoded, alphabet)
+            try:
+                text = raw.decode("utf-8")
+                utf8_valid = True
+            except UnicodeDecodeError:
+                text = raw.decode("utf-8", errors="replace")
+                utf8_valid = False
+            recovered.append({
+                "index": index,
+                "marker": "4",
+                "text": text,
+                "utf8_valid": utf8_valid,
+                "hex": raw.hex(),
+                "encoded": encoded,
+            })
+        else:
+            recovered.append({
+                "index": index,
+                "marker": encoded[:1],
+                "text": None,
+                "utf8_valid": None,
+                "hex": None,
+                "encoded": encoded,
+                "note": "No custom-85 decoding applied to this entry",
+            })
+
+    json_path = output_dir / "decoded_strings.json"
+    json_path.write_text(json.dumps(recovered, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    lines = [
+        "WEAREDEVS v1.0.0 — static string-table recovery",
+        "================================================",
+        f"Input: {input_path.name}",
+        f"SHA256: {hashlib.sha256(source_bytes).hexdigest()}",
+        f"E table entries: {len(entries)}",
+        f"Custom alphabet entries: {len(alphabet)}",
+        f"Shuffle operations: {len(shuffle_pairs)}",
+        "",
+        "Recovered entries (table index is 1-based):",
+    ]
+    for item in recovered:
+        if item["text"] is None:
+            lines.append(f"[{item['index']:02d}] [not decoded] {item['encoded']!r}")
+        else:
+            printable = item["text"].encode("unicode_escape").decode("ascii")
+            lines.append(f"[{item['index']:02d}] {printable}  (hex={item['hex']})")
+    lines += [
+        "",
+        "LIMITATION: This recovers the shuffled custom-85 string table only.",
+        "It does not devirtualize or reconstruct the original Lua program.",
+        "The target Lua file was never executed.",
+    ]
+    (output_dir / "decoded_strings.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    report = [
+        "Static analysis completed successfully.",
+        f"Input SHA256: {hashlib.sha256(source_bytes).hexdigest()}",
+        f"E-table entries: {len(entries)}",
+        f"Decoded custom-85 entries: {sum(item['text'] is not None for item in recovered)}",
+        f"UTF-8-invalid decoded entries: {sum(item['utf8_valid'] is False for item in recovered)}",
+        f"Shuffle pairs: {shuffle_pairs}",
+        "No target Lua code was executed.",
+        "Full virtual-machine devirtualization is not performed.",
+    ]
+    (output_dir / "analysis.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+    print("\n".join(report))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+===== FILE: README.md =====
+
+# WEAREDEVS v1.0.0 static string-table recovery
+
+This repository addition statically extracts the initial `E` string table,
+replays its three table-shuffle operations, extracts the 85-character custom
+alphabet, and decodes entries carrying the `4` marker.
+
+## Install in your repository
+
+Copy these files into the repository:
+
+- `.github/workflows/deobfuscate.yml`
+- `tools/wearedevs_static.py`
+
+Commit the target `.lua` file to the repository. In GitHub, open **Actions**,
+select **WEAREDEVS Static Deobfuscation**, choose **Run workflow**, and enter
+the Lua file path (for example, `script.lua`).
+
+## Output artifact
+
+The workflow uploads `wearedevs-static-deobfuscation` containing:
+
+- `analysis.txt` — summary of the static extraction.
+- `decoded_strings.txt` — recovered table entries in readable form.
+- `decoded_strings.json` — recovered text and hex bytes for each entry.
+
+## Scope and safety
+
+The target Lua program is never executed. This recovers the shuffled custom-85
+string table only; it does not reconstruct the original source from the
+virtualized interpreter. A decoded table is not proof that the script is safe.
